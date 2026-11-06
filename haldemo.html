@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HAL demo</title>
+<style>
+@font-face { font-family: Michroma; src: url(fonts/Michroma.ttf); }
+@font-face { font-family: ShareTechMono; src: url(fonts/ShareTechMono.woff2); }
+html, body { margin: 0; height: 100%; overflow: hidden; color: #fff; background: #000; }
+.scr { position: fixed; inset: 0; opacity: 0; transform: scale(var(--z, 1)); }
+.scr.on { opacity: 1; }
+.scr svg { width: 100%; height: 100%; }
+.card text { fill: #fff; font-family: Michroma, sans-serif; }
+.card .w { stroke: #fff; stroke-linejoin: miter; stroke-miterlimit: 2; filter: drop-shadow(0 0 2.5px #fff5); } /* Michroma has one weight; the stroke fakes the video's heavy word */
+.card .l { filter: drop-shadow(0 0 3px #fff8); }
+#hal { position: fixed; right: 2.5vw; bottom: 4vh; font: 13px ShareTechMono, monospace; letter-spacing: .4em; z-index: 1; }
+#sn { position: fixed; top: 2vh; right: 2.5vw; font: 700 20px Arial, Helvetica, sans-serif; color: #ffe600; text-shadow: 0 0 3px #000; z-index: 3; pointer-events: none; }
+#dbg { position: fixed; top: 2vh; left: 2.5vw; font: 700 15px/1.6 ShareTechMono, monospace; color: #ffe600; text-shadow: 0 0 3px #000; z-index: 3; pointer-events: none; }
+#cfg { position: fixed; right: 16px; bottom: 16px; padding: 14px 18px; background: #000c; color: #fff; font: 14px ShareTechMono, monospace; border: 1px solid #fff6; display: none; z-index: 2; }
+#cfg.on { display: block; }
+#cfg input[type=range] { width: 10em; vertical-align: middle; margin: 0 6px; }
+#cfg button, #scp button { font: inherit; color: #fff; background: #fff2; border: 1px solid #fff6; padding: 2px 8px; cursor: pointer; }
+#scp { position: fixed; left: 12px; top: 12px; bottom: 12px; width: 310px; display: none; flex-direction: column; background: #000d; color: #fff; font: 13px ShareTechMono, monospace; border: 1px solid #fff6; z-index: 4; }
+#scp.on { display: flex; }
+#scph { padding: 10px; border-bottom: 1px solid #fff4; display: flex; gap: 8px; align-items: center; }
+#scph b { flex: 1; }
+#scl { overflow: auto; padding: 6px 10px; }
+#scl label { display: flex; gap: 8px; align-items: center; padding: 2px 0; cursor: pointer; }
+#scl label.cur { color: #ffe600; }
+#scl small { color: #fff8; margin-left: auto; }
+</style>
+</head>
+<body>
+<div id="hal">HAL</div>
+<div id="sn" style="display:none"></div>
+<div id="dbg" style="display:none"></div>
+<div id="cfg">Speed <input id="spd" type="range" min=".25" max="4" step=".25"> <span id="spdv"></span> &nbsp;Scale <input id="zm" type="range" min=".25" max="2" step=".05"> <span id="zmv"></span> &nbsp;slide <span id="num"></span> &nbsp;(C closes, N next, B back, S skip to 4 s before the end, then next scene, R restart, A scene number, V pick scenes) <button id="scb">Scenes…</button></div>
+<div id="scp"><div id="scph"><b>Scenes</b><button id="sca">All</button><button id="scn">None</button><button id="scx">×</button></div><div id="scl"></div></div>
+
+<script src="haldemo-cards.js"></script>
+<script src="haldemo-timeline.js"></script>
+<script>
+// The show is the video's own timeline (hal-frames/timeline.py): title cards are drawn from measurements (hal-frames/cardsdata.py),
+// the graphics are real SVG elements (lines, polylines, polygons, rects, text) measured from the frames (hal-frames/trace.py, prim.py),
+// plus hand-written screens in haldemo/screens/. Slides load one ahead and unload when far behind.
+const $ = id => document.getElementById(id);
+const q = new URLSearchParams(location.search); // ?s=SLIDE&t=SECONDS or ?v=VIDEO_SECONDS shows one slide frozen (used by hal-frames/compare.py)
+let speed = 1; try { speed = +localStorage.haldemoSpeed || 1; } catch {}
+// A toggles a debug overlay: the yellow scene number (top right) plus a top-left readout of lengths and countdowns
+let debug = false;
+const SHOWLEN = TIMELINE.reduce((a, s) => a + s.d, 0);   // full timeline length (ignores switched-off scenes)
+const fmt = v => `${v.toFixed(1)}s (${Math.floor(v / 60)}m ${(v % 60).toFixed(1)}s)`;  // seconds, and minutes + seconds in parens
+const drawNum = () => { $('sn').style.display = debug ? '' : 'none'; };
+const drawDbg = () => {
+  const on = debug && ready;
+  $('dbg').style.display = on ? '' : 'none';
+  if (!on) return;
+  let el = 0; for (let i = 0; i < cur; i++) el += TIMELINE[i].d;
+  const d = TIMELINE[cur].d;
+  $('dbg').innerHTML = `Scene Length: ${fmt(d)}<br>Show Length: ${fmt(SHOWLEN)}<br>Scene End: ${fmt(Math.max(0, d - t))}<br>Show End: ${fmt(Math.max(0, SHOWLEN - el - t))}<br>Show Runtime: ${fmt(el + t)}`;
+};
+const slideId = s => ({ card: 'card-' + s.id, native: 'nat-' + s.n }[s.k] || 'tr-' + s.n);
+const live = {}; // native screens that have been mounted: name -> {update(t)}
+window.TRACED = {};
+
+// ---- which scenes play: kept as the list of switched-off scenes (so scenes added later are on by default), saved in localStorage
+let off = new Set(); try { off = new Set(JSON.parse(localStorage.haldemoOff || '[]')); } catch {}
+const saveOff = () => { try { localStorage.haldemoOff = JSON.stringify([...off]); } catch {} };
+// the next switched-on scene after i (dir +1) or before it (dir -1); -1 when every scene is off
+const nextOn = (i, dir = 1) => { const n = TIMELINE.length; for (let k = 1; k <= n; k++) { const j = (((i + dir * k) % n) + n) % n; if (!off.has(j)) return j; } return -1; };
+const go = i => { if (i >= 0) show(i); };
+
+// ---- title cards: each glyph's ink is fitted to the box measured in the video, whatever the font's own proportions
+const SW = 12;
+const ctx = document.createElement('canvas').getContext('2d');
+function fit(txt, [x0, x1, y0, y1], extra = '') {
+  ctx.font = '100px Michroma'; const m = ctx.measureText(txt);
+  const l = m.actualBoundingBoxLeft, w = l + m.actualBoundingBoxRight, h = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
+  const sx = (x1 - x0) / w, sy = (y1 - y0) / h;
+  return `<text ${extra} transform="translate(${x0 + l * sx} ${y1 - m.actualBoundingBoxDescent * sy}) scale(${sx} ${sy})" font-size="100" xml:space="preserve">${txt}</text>`;
+}
+function buildCards() {
+  for (const c of CARDS) {
+    const d = document.createElement('div');
+    d.className = 'scr card'; d.id = 'card-' + c.id; d.style.background = c.bg;
+    d.innerHTML = '<svg viewBox="0 0 1920 810" preserveAspectRatio="xMidYMid meet">' + fit(c.text, [c.label[0], c.label[1], c.lrow[0], c.lrow[1]], 'class="l"') +
+      c.glyphs.map(([a, b], i) => fit(c.id[i], [a + SW / 2, b - SW / 2, c.wrow[0] + SW / 2, c.wrow[1] - SW / 2], `class="w" stroke-width="${SW}"`)).join('') + '</svg>';
+    document.body.insertBefore(d, $('hal'));
+  }
+}
+
+// ---- measured slides: loaded on demand; every group of elements fades in when it appeared in the video and out when it went
+const loading = {};
+function load(i) {
+  const s = TIMELINE[i];
+  if (s && s.k === 'native') {  // hand-written screens (haldemo/screens/*.js): loaded on demand, mounted once, then driven by the slide clock
+    if (loading[s.n]) return loading[s.n];
+    const mod = s.m || s.n; // several slides can share one module (textscreen) with their own params
+    return loading[s.n] = new Promise(res => {
+      const mount = () => { const d = document.createElement('div'); d.className = 'scr'; d.id = 'nat-' + s.n; document.body.insertBefore(d, $('hal')); live[s.n] = NATIVE[mod].mount(d, s.p); res(); };
+      if (window.NATIVE && NATIVE[mod]) return mount();
+      const el = document.createElement('script'); el.src = `haldemo/screens/${mod}.js`;
+      el.onload = mount; el.onerror = () => { live[s.n] = { update() {} }; res(); };
+      document.head.appendChild(el);
+    });
+  }
+  if (!s || s.k === 'card') return Promise.resolve();
+  if (loading[s.n]) return loading[s.n];
+  return loading[s.n] = new Promise(res => {
+    const el = document.createElement('script'); el.src = `haldemo-trace-${s.n}.js`;
+    const done = (tr) => {
+      const d = document.createElement('div');
+      d.className = 'scr'; d.id = 'tr-' + s.n; d.style.background = tr ? tr.bg : '#000';
+      if (tr) d.innerHTML = '<svg viewBox="0 0 1920 810" preserveAspectRatio="xMidYMid meet">' + tr.groups.map(g => g.m || `<g color="${g.c}" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">${g.e.join('')}</g>`).join('') + '</svg>';
+      document.body.insertBefore(d, $('hal'));
+      if (tr) tr.groups.forEach(g => { delete g.e; delete g.m; }); // the DOM has them now; keep only the timings
+      res();
+    };
+    el.onload = () => done(TRACED[s.n]);
+    el.onerror = () => done(null); // not traced (yet): show a black screen for its length
+    document.head.appendChild(el);
+  });
+}
+function playTraced(n) {
+  const tr = TRACED[n]; if (!tr) return;
+  const box = $('tr-' + n); box.getAnimations().forEach(x => x.cancel());
+  if (tr.bgs) { // the background fades through the colours it had in the video
+    const T = Math.max(tr.total, tr.bgs[tr.bgs.length - 1][0] + .01) * 1000;
+    box.animate([...tr.bgs.map(([t, c]) => ({ backgroundColor: c, offset: Math.min(1, t * 1000 / T) })), { backgroundColor: tr.bgs[tr.bgs.length - 1][1], offset: 1 }].map((k, i, all) => (i && k.offset <= all[i - 1].offset ? { ...k, offset: Math.min(1, all[i - 1].offset + 1e-4) } : k)), { duration: T, fill: 'both' });
+  }
+  document.querySelectorAll('#tr-' + n + ' svg > *').forEach((p, i) => {
+    const g = tr.groups[i]; if (!g) return;
+    const a = g.t * 1000, u = (g.u ?? tr.total + 1) * 1000, D = u + 50;
+    p.getAnimations().forEach(x => x.cancel());
+    if (u <= a) { p.style.display = 'none'; return; } // never visible
+    p.animate([{ opacity: 0, offset: 0 }, { opacity: 0, offset: a / D }, { opacity: 1, offset: Math.min(u / D, a / D + 1e-4) }, { opacity: 1, offset: u / D }, { opacity: 0, offset: 1 }], { duration: D, fill: 'both' });
+  });
+}
+// drop slides that are far from the one playing so a long show does not pile up thousands of DOM nodes
+function unload(keep) {
+  TIMELINE.forEach((s, i) => {
+    if (s.k !== 'trace' || keep.has(i) || !loading[s.n]) return;
+    const d = $('tr-' + s.n); if (d) d.remove();
+    const sc = document.querySelector(`script[src="haldemo-trace-${s.n}.js"]`); if (sc) sc.remove();
+    delete TRACED[s.n]; delete loading[s.n];
+  });
+}
+
+// ---- playback
+let cur = 0, t = 0, prev = performance.now(), frozen = false, ready = false;
+// playbackRate scales CSS and Web animations, delays included, so one number sets the pace of the whole show
+const rate = () => document.getAnimations().forEach(a => a.playbackRate = speed);
+let token = 0;
+async function show(i) {
+  i = (i + TIMELINE.length) % TIMELINE.length; ready = false;
+  const mine = ++token;
+  await load(i);
+  if (mine !== token) return; // a newer request (a quick key press) took over while this one loaded
+  cur = i; t = 0; markCur(); $('num').textContent = `${i + 1}/${TIMELINE.length}`; $('sn').textContent = `Scene ${i + 1}`; drawNum();
+  const id = slideId(TIMELINE[i]);
+  document.querySelectorAll('.scr').forEach(e => e.classList.toggle('on', e.id === id));
+  if (TIMELINE[i].k === 'trace') playTraced(TIMELINE[i].n);
+  if (TIMELINE[i].k === 'native') live[TIMELINE[i].n].update(0);
+  rate(); ready = true; prev = performance.now();
+  load((i + 1) % TIMELINE.length); // have the next one waiting
+  unload(new Set([i, (i + 1) % TIMELINE.length, (i - 1 + TIMELINE.length) % TIMELINE.length]));
+}
+(function tick(now) {
+  requestAnimationFrame(tick);
+  if (frozen || !ready) return;
+  t += Math.min(1, (now - prev) / 1000) * speed; prev = now; // real elapsed time, so a slow frame does not slow the show (capped for a tab that was asleep)
+  if (TIMELINE[cur].k === 'native') live[TIMELINE[cur].n].update(t);
+  document.body.dataset.t = t.toFixed(1); // for debugging / tests
+  drawDbg();
+  if (t >= TIMELINE[cur].d) { const n = nextOn(cur); if (n >= 0) show(n); else t = TIMELINE[cur].d; } // after the last scene it loops back to the first; with every scene off it just holds
+})(prev);
+
+let zoom = 1; try { zoom = +localStorage.haldemoScale || 1; } catch {}
+const setZoom = () => { document.documentElement.style.setProperty('--z', zoom); $('zm').value = zoom; $('zmv').textContent = Math.round(zoom * 100) + '%'; };
+$('zm').oninput = e => { zoom = +e.target.value; setZoom(); try { localStorage.haldemoScale = zoom; } catch {} };
+setZoom();
+$('spd').value = speed; $('spdv').textContent = speed + '×';
+$('spd').oninput = e => { speed = +e.target.value; $('spdv').textContent = speed + '×'; rate(); try { localStorage.haldemoSpeed = speed; } catch {} };
+// S: jump to 4 s before the end of this scene; pressed again (already in the last 4 s) it goes to the next scene
+function skip() {
+  const d = TIMELINE[cur].d;
+  if (d - t > 4.05) {
+    t = d - 4;
+    for (const a of document.getAnimations()) if (!(a instanceof CSSTransition)) a.currentTime = t * 1000;
+    if (TIMELINE[cur].k === 'native') live[TIMELINE[cur].n].update(t);
+  } else go(nextOn(cur));
+}
+// scene picker: a check box per scene, All / None, the choice is saved
+function buildPicker() {
+  $('scl').innerHTML = TIMELINE.map((s, i) => `<label data-i="${i}"><input type="checkbox" data-i="${i}" ${off.has(i) ? '' : 'checked'}><span>${s.label || 'Scene ' + (i + 1)}</span><small>${s.k === 'card' ? 'card ' + s.id : s.k === 'native' ? s.n.replace(/^(ts|cb)/, '') : 'drawn'}</small></label>`).join('');
+}
+function markCur() { document.querySelectorAll('#scl label').forEach(l => l.classList.toggle('cur', +l.dataset.i === cur)); }
+function togglePicker() { const p = $('scp'); if (!p.classList.contains('on') && !$('scl').children.length) buildPicker(); p.classList.toggle('on'); markCur(); }
+$('scl').addEventListener('change', e => { const i = +e.target.dataset.i; e.target.checked ? off.delete(i) : off.add(i); saveOff(); });
+$('scl').addEventListener('click', e => { if (e.target.tagName === 'SPAN') { e.preventDefault(); go(+e.target.parentNode.dataset.i); markCur(); } });
+const setAll = on => { off = on ? new Set() : new Set(TIMELINE.map((_, i) => i)); saveOff(); document.querySelectorAll('#scl input').forEach(c => c.checked = on); };
+$('sca').onclick = () => setAll(true); $('scn').onclick = () => setAll(false); $('scx').onclick = togglePicker; $('scb').onclick = togglePicker;
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox' && e.key !== 'c') return;
+  const k = e.key.toLowerCase();
+  if (k === 'c') $('cfg').classList.toggle('on');
+  else if (k === 'r') go(nextOn(TIMELINE.length - 1));
+  else if (k === 'n') go(nextOn(cur));
+  else if (k === 'b') go(nextOn(cur, -1));
+  else if (k === 's') skip();
+  else if (k === 'v') togglePicker();
+  else if (k === 'a') { debug = !debug; drawNum(); drawDbg(); }
+});
+
+Promise.all([document.fonts.load('100px Michroma'), document.fonts.load('20px ShareTechMono')]).then(async () => {
+  buildCards();
+  let i = +q.get('s') || +q.get('go') || 0, at = +q.get('t') || 0;   // ?go=N starts playing live at slide N (no freezing)
+  if (q.has('v')) { const v = +q.get('v'); i = TIMELINE.findIndex(s => v >= s.t0 && v < s.t0 + s.d); at = v - TIMELINE[i].t0; }
+  if (!q.has('s') && !q.has('v') && off.has(i) && nextOn(i) >= 0) i = nextOn(i);   // start on the first scene that is switched on
+  await show(i);
+  if (q.has('s') || q.has('v')) {
+    frozen = true;
+    if (TIMELINE[cur].k === 'native') live[TIMELINE[cur].n].update(at);
+    for (const a of document.getAnimations()) { if (a instanceof CSSTransition) a.finish(); else { a.pause(); a.currentTime = at * 1000; } }
+  }
+});
+</script>
+</body>
+</html>
